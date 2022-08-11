@@ -50,11 +50,14 @@ class ActorCritic(object):
         self.actionlist = []
         self.currentstatelist = []
         self.nextstatelist = []
+        self.probabilitylist = []
         self.memoryindex = 0
+        
         self.epsilon = epsilon
         self.gamma = gamma
         self.device = device
         self.collecteposide = collect_eposide
+        self.targetactor = Actor(self.device)
         self.actor = Actor(self.device)
         self.critic = Net(self.device)
         self.targetcritic = Net(self.device)
@@ -64,17 +67,30 @@ class ActorCritic(object):
         self.TDloss = nn.MSELoss()
         self.numtest = NUM_TEST
         self.testtime = 1
-        self.writer = SummaryWriter('logs/'+datetime.now().strftime('%m%d_%H%M%S'))
+        self.writer = SummaryWriter('logs/offlinePG/'+datetime.now().strftime('%m%d_%H%M%S'))
 
     
-    def getaction(self,state):
+    def getaction(self,state,mode = 'collect'):
+        '''
+        mode is collect means use targetnet to determine what action todo
+        model is evaluate means use net to evaluate the performance of net
+        '''
         if random() < self.epsilon:
-            return randint(0,1)
+            return randint(0,1),0.5
         else:
             # print("state is",state)
             # print("type of state is",type(state))
-            prob = self.actor(state)
-            return torch.distributions.Categorical(prob).sample().item()
+            if mode == 'collect':
+                prob = self.targetactor(state)
+            elif mode == 'evaluate':
+                prob = self.actor(state)
+            else:
+                raise NotImplementedError
+            # prob = self.actor(state)
+            action = torch.distributions.Categorical(prob).sample().item()
+            # print("call the getaction",mode,action,prob[action])
+            return action,prob[action]
+            # return torch.distributions.Categorical(prob).sample().item()
             # return int(torch.argmax(state))
     def collectoneepisode(self):
         done = False
@@ -83,35 +99,38 @@ class ActorCritic(object):
         self.rewardlist = []
         self.currentstatelist = []
         self.nextstatelist = []
+        self.probabilitylist = []
         while done == False:
-            action = self.getaction(state)
+            # print(self.getaction(state,mode='collect'))
+            action,prob = self.getaction(state,mode='collect')
             next_state, reward, done, info = self.trainenv.step(action)
             reward = self.getrealreward(next_state)
             self.actionlist.append(action)
             self.currentstatelist.append(state)
             self.rewardlist.append(reward)
             self.nextstatelist.append(next_state)
+            self.probabilitylist.append(prob)
             state = next_state
     def getrealreward(self,state):
         x,x_dot,theta,theta_dot = state
         r1 = (self.trainenv.x_threshold - abs(x)) / self.trainenv.x_threshold - 0.8
         r2 = (self.trainenv.theta_threshold_radians - abs(theta)) / self.trainenv.theta_threshold_radians - 0.5
         return r1 + r2
-    def collect(self):
-        collecttime = 0
-        while collecttime < self.collecteposide:
-            current_state = self.trainenv.reset()
-            # action = self.getaction(current_state)
-            done = False
-            while done == False:
-                action = self.getaction(current_state)
-                next_state,reward,done,info = self.trainenv.step(action)
-                reward = self.getrealreward(next_state)
-                self.memory[self.memoryindex] = np.hstack((current_state,(action,reward),next_state))
-                self.memoryindex += 1
-                self.memoryindex %= MAX_SIZE
-                current_state = next_state
-            collecttime += 1
+    # def collect(self):
+    #     collecttime = 0
+    #     while collecttime < self.collecteposide:
+    #         current_state = self.trainenv.reset()
+    #         # action = self.getaction(current_state)
+    #         done = False
+    #         while done == False:
+    #             action = self.getaction(current_state)
+    #             next_state,reward,done,info = self.trainenv.step(action)
+    #             reward = self.getrealreward(next_state)
+    #             self.memory[self.memoryindex] = np.hstack((current_state,(action,reward),next_state))
+    #             self.memoryindex += 1
+    #             self.memoryindex %= MAX_SIZE
+    #             current_state = next_state
+    #         collecttime += 1
     
     def CriticUpdate(self):
         # update the Critic Net for Action Value Evaluation
@@ -141,7 +160,7 @@ class ActorCritic(object):
             done = False
             
             while done == False:
-                action = self.getaction(state)
+                action,_ = self.getaction(state,mode='evaluate')
                 state,reward,done,info = self.testenv.step(action)
                 totalresult += reward
         self.writer.add_scalar('reward',totalresult/self.numtest,self.testtime)
@@ -153,24 +172,21 @@ class ActorCritic(object):
         # update the Actor based on optimization J(theta)
         # loss function is Q(s,a)\log \pi(a|s)
         # You need to seed Learning rate < 0 to gradient incredement
+        # pi(a|s)/beta(a|s) Q(s,a) is the weight
         self.actoroptimizer.zero_grad()
         action = torch.tensor(self.actionlist).to(self.device).to(torch.int64)
         # reward = torch.tensor(self.rewardlist).to(self.device).to(torch.float32)
         currentstate = torch.from_numpy(np.array(self.currentstatelist)).to(self.device).to(torch.float32)
-        nextstate = torch.from_numpy(np.array(self.nextstatelist)).to(self.device).to(torch.float32)
-        # index = np.random.choice(MAX_SIZE,self.batchsize)
-        # sampledata = self.memory[index,:]
-        # current_state = sampledata[:,:4]
-        # action = torch.from_numpy(sampledata[:,5]).to(self.device).to(torch.int64)
-        # reward = torch.from_numpy(sampledata[:,6]).to(self.device)
-        # next_state = sampledata[:,6:]
-        # current_value = self.critic(currentstate)``
+        currentprob =  self.actor(currentstate)
+        currentprob = torch.gather(currentprob,-1,action.unsqueeze(0)).squeeze().detach().cuda()
+        oldprob = torch.tensor(self.probabilitylist).detach().cuda()
         current_policy = self.actor(currentstate)
         policy = torch.gather(current_policy,-1,action.unsqueeze(-1)).squeeze()
         value = [sum(self.rewardlist[i:]) for i in range(len(self.rewardlist))]
         value = torch.tensor(value).to(self.device).to(torch.float32)
+        weight = currentprob/oldprob * value.cuda().detach()
         # value = torch.gather(current_value,-1,action.unsqueeze(-1)).squeeze().detach()
-        self.BCELoss = BCELoss(weight=value)
+        self.BCELoss = BCELoss(weight=weight)
         loss = self.BCELoss(policy,torch.ones(len(self.rewardlist)).to(self.device))
         loss.backward()
         self.actoroptimizer.step()
@@ -203,6 +219,8 @@ class ActorCritic(object):
             # self.testenv()
             if index % 10 == 0:
                 self.targetcritic.load_state_dict(self.critic.state_dict())
+            if index % 100 == 0:
+                self.targetactor.load_state_dict(self.actor.state_dict())
         
 
 
