@@ -14,3 +14,6 @@ Critic Target Net $Q(s,a,\hat\omega)$ for calculate the TD error of a transition
 ## Question
 Shared Feature Extraction of Actor and Critic or Not?
 Policy Gradient we use must be on-policy which indicates all experience used to update the policy is collected by the policy itself
+
+## target Critic
+maintain two Critic $c_1,c_2$,$c_1$ is used for collecting data and $c_2$ is used for validation,Their parameters are synchronized after a few update.Thus is is a Off-Policy Gradient Descent.
